@@ -1,0 +1,18 @@
+pandas>=2.0
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+seaborn>=0.12
+streamlit>=1.30
+openpyxl>=3.1
+joblib>=1.3
+scikit-learn>=1.3
+xgboost>=2.0
+lightgbm>=4.0
+
+# Optional: enables the "贝叶斯威布尔 (PyMC)" fitting method in the sidebar.
+# The app falls back to the MLE Weibull fit automatically if these are not
+# installed, so they may be removed from this file in constrained
+# environments (e.g. if PyMC's build toolchain is unavailable on Windows).
+pymc>=5.10
+arviz>=0.17

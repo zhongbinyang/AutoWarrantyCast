@@ -1,0 +1,37 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging (CRITICAL: exclude large executables and build caches)
+build/
+dist/
+*.manifest
+*.spec.bak
+*.exe
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / Editor caches
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
+.gemini/
+
+# Temporary / test scratch files
+scratch/
+start_debug_chrome.bat
+forecast_result_screenshot.png
+微信图片_*.jpg
+
+# Logs
+*.log
