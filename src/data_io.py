@@ -1,17 +1,14 @@
-"""Data import, validation and normalization for the warranty cost system.
+"""Unified Excel import, sheet mapping, validation and triangle normalization.
 
-Handles the three input file families described in the specification:
-
-1. Monthly new-vehicle sales (CSV/Excel, columns ``销售月份`` / ``销量``).
-2. Claim triangles (Excel, one sheet per system, rows = sale month, columns
-   = development period ``MIS0, MIS1, ...``) for both claim count and claim
-   amount.
-3. Optional monthly mileage input (CSV, columns ``销售月份`` / ``月均行驶里程``).
+One workbook contains sales, historical claim triangles, optional mileage
+and optional actual incremental triangles for forecast validation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from io import BytesIO
+import re
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -21,13 +18,225 @@ from .utils import (
     MILEAGE_COL,
     SALE_MONTH_COL,
     SALES_COL,
+    SYSTEM_LIST,
     cumulative_to_incremental,
     is_cumulative,
     normalize_sale_month,
+    parse_mis_age,
     sorted_mis_columns,
 )
 
 FileLike = Union[str, bytes, "object"]
+
+SHEET_PURPOSES = ["忽略", "销量", "历史索赔", "月均里程", "验证数据"]
+CLAIM_METRICS = ["台次", "金额"]
+
+
+@dataclass(frozen=True)
+class SheetMapping:
+    sheet_name: str
+    purpose: str = "忽略"
+    system: str = ""
+    metric: str = ""
+
+
+@dataclass
+class WorkbookImport:
+    sales: pd.DataFrame
+    bundles: Dict[str, "TriangleBundle"]
+    mileage: Optional[pd.DataFrame]
+    actuals: Dict[str, Dict[str, pd.DataFrame]]
+    issues: List["ValidationIssue"]
+
+
+def read_workbook(file: FileLike) -> Dict[str, pd.DataFrame]:
+    """Read all sheets once, preserving duplicate headers for validation."""
+    if isinstance(file, bytes):
+        file = BytesIO(file)
+    elif hasattr(file, "seek"):
+        file.seek(0)
+    with pd.ExcelFile(file, engine="openpyxl") as workbook:
+        sheets = {}
+        for name in workbook.sheet_names:
+            raw = pd.read_excel(workbook, sheet_name=name, header=None)
+            if raw.empty:
+                sheets[name] = pd.DataFrame()
+                continue
+            df = raw.iloc[1:].copy()
+            df.columns = [str(c).strip() if pd.notna(c) else "" for c in raw.iloc[0]]
+            sheets[name] = df.reset_index(drop=True)
+    return sheets
+
+
+def suggest_sheet_mappings(sheets: Dict[str, pd.DataFrame]) -> List[SheetMapping]:
+    """Use explicit sheet names for claims; never infer metrics from values."""
+    mappings = []
+    for name, df in sheets.items():
+        compact = re.sub(r"[\s_\-—－（）()·.]+", "", name)
+        columns = {str(c).strip() for c in df.columns}
+        mapping = SheetMapping(name)
+        if "说明" not in compact:
+            systems = [s for s in SYSTEM_LIST if s in compact]
+            metrics = [m for m in CLAIM_METRICS if m in compact]
+            if len(systems) == 1 and len(metrics) == 1:
+                purpose = "验证数据" if any(w in compact for w in ("验证", "实际", "真实")) else "历史索赔"
+                mapping = SheetMapping(name, purpose, systems[0], metrics[0])
+            elif not systems and not metrics:
+                is_sales = compact in ("销量", "月度销量") or {SALE_MONTH_COL, SALES_COL} <= columns
+                is_mileage = compact in ("月均里程", "月均行驶里程") or {SALE_MONTH_COL, MILEAGE_COL} <= columns
+                if is_sales and not is_mileage:
+                    mapping = SheetMapping(name, "销量")
+                elif is_mileage and not is_sales:
+                    mapping = SheetMapping(name, "月均里程")
+        mappings.append(mapping)
+    return mappings
+
+
+def _checked_table(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.replace(r"^\s*$", np.nan, regex=True).dropna(how="all")
+    df = df.loc[:, ~((df.columns == "") & df.isna().all().to_numpy())]
+    if df.columns.duplicated().any():
+        raise ValueError("存在重复列名")
+    if df.empty:
+        raise ValueError("数据为空")
+    if SALE_MONTH_COL not in df:
+        raise ValueError(f"缺少 '{SALE_MONTH_COL}' 列")
+    months = []
+    for row, value in df[SALE_MONTH_COL].items():
+        try:
+            if pd.isna(value):
+                raise ValueError("空月份")
+            month = normalize_sale_month(value)
+            if month == "NaT":
+                raise ValueError("无效月份")
+            months.append(month)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError(f"第 {row + 2} 行销售月份无效: {value}") from exc
+    df[SALE_MONTH_COL] = months
+    return df
+
+
+def _numeric_columns(df: pd.DataFrame, columns: List[str], *, integer=False, allow_blank=False) -> pd.DataFrame:
+    for col in columns:
+        if col not in df:
+            raise ValueError(f"缺少 '{col}' 列")
+        values = pd.to_numeric(df[col], errors="coerce")
+        invalid = values.isna() & (df[col].notna() if allow_blank else True)
+        invalid |= values.notna() & (~np.isfinite(values) | (values < 0))
+        if integer:
+            invalid |= values.notna() & (values % 1 != 0)
+        if invalid.any():
+            row = invalid[invalid].index[0]
+            rule = "非负整数" if integer else "非负数值"
+            raise ValueError(f"第 {row + 2} 行 '{col}' 必须为有限的{rule}")
+        df[col] = values
+    return df
+
+
+def _normalize_triangle(df: pd.DataFrame, metric: str) -> pd.DataFrame:
+    df = _checked_table(df)
+    df = df.rename(columns={c: f"MIS{parse_mis_age(c)}" for c in df.columns if parse_mis_age(c) is not None})
+    if df.columns.duplicated().any():
+        raise ValueError("存在重复的 MIS 发展期列")
+    columns = sorted_mis_columns(df.columns)
+    if not columns:
+        raise ValueError("未找到任何 MIS<n> 发展期列")
+    df = _numeric_columns(df, columns, integer=metric == "台次", allow_blank=True)
+    if not df[columns].notna().to_numpy().any():
+        raise ValueError("三角形数据全部为空")
+    return df.groupby(SALE_MONTH_COL)[columns].sum(min_count=1)
+
+
+def load_workbook_data(sheets: Dict[str, pd.DataFrame], mappings: List[SheetMapping]) -> WorkbookImport:
+    """Validate the whole selection before returning a new import snapshot.
+
+    Validation triangles are explicitly incremental and are kept separate
+    from the historical bundles and their inferred evaluation months.
+    """
+    errors = []
+    selected = {}
+    seen_sheets = set()
+    for mapping in mappings:
+        if mapping.purpose == "忽略":
+            continue
+        label = f"Sheet「{mapping.sheet_name}」"
+        if mapping.sheet_name not in sheets:
+            errors.append(f"{label}不存在")
+        if mapping.sheet_name in seen_sheets:
+            errors.append(f"{label}被重复使用")
+        seen_sheets.add(mapping.sheet_name)
+        if mapping.purpose not in SHEET_PURPOSES:
+            errors.append(f"{label}用途无效")
+        claim = mapping.purpose in ("历史索赔", "验证数据")
+        if claim and (mapping.system not in SYSTEM_LIST or mapping.metric not in CLAIM_METRICS):
+            errors.append(f"{label}请选择有效的系统及台次/金额指标")
+        key = (mapping.purpose, mapping.system if claim else "", mapping.metric if claim else "")
+        if key in selected:
+            errors.append(f"{label}与 Sheet「{selected[key].sheet_name}」映射重复")
+        selected[key] = mapping
+    if ("销量", "", "") not in selected:
+        errors.append("必须选择一个销量 Sheet")
+    systems = {key[1] for key in selected if key[0] == "历史索赔"}
+    if not systems:
+        errors.append("至少选择一个系统的历史台次和金额 Sheet")
+    for system in sorted(systems):
+        for metric in CLAIM_METRICS:
+            if ("历史索赔", system, metric) not in selected:
+                errors.append(f"[{system}] 缺少历史{metric} Sheet")
+    for key, mapping in selected.items():
+        if key[0] == "验证数据" and key[1] not in systems:
+            errors.append(f"Sheet「{mapping.sheet_name}」对应系统未导入历史索赔")
+    if errors:
+        raise ValueError("\n".join(errors))
+
+    tables = {}
+    for key, mapping in selected.items():
+        try:
+            raw = sheets[mapping.sheet_name]
+            if key[0] in ("历史索赔", "验证数据"):
+                tables[key] = _normalize_triangle(raw, key[2])
+            else:
+                df = _checked_table(raw)
+                column = SALES_COL if key[0] == "销量" else MILEAGE_COL
+                df = _numeric_columns(df, [column], integer=column == SALES_COL)
+                if column == MILEAGE_COL and df[SALE_MONTH_COL].duplicated().any():
+                    raise ValueError("同一销售月份存在多条里程记录")
+                df = df.groupby(SALE_MONTH_COL, as_index=False)[[column]].sum()
+                if column == SALES_COL:
+                    if df[column].sum() <= 0:
+                        raise ValueError("总销量必须大于 0")
+                    df[column] = df[column].astype(int)
+                tables[key] = df
+        except (ValueError, TypeError, OverflowError) as exc:
+            errors.append(f"Sheet「{mapping.sheet_name}」: {exc}")
+    if errors:
+        raise ValueError("\n".join(errors))
+
+    sales = tables[("销量", "", "")]
+    mileage = tables.get(("月均里程", "", ""))
+    issues = []
+    if mileage is not None:
+        missing = sorted(set(sales[SALE_MONTH_COL]) - set(mileage[SALE_MONTH_COL]))
+        if missing:
+            issues.append(ValidationIssue("warning", f"月均里程缺少销售月份 {missing}，这些批次按 0 公里/月处理"))
+    bundles = {}
+    for system in SYSTEM_LIST:
+        if system not in systems:
+            continue
+        count_key, amount_key = ("历史索赔", system, "台次"), ("历史索赔", system, "金额")
+        try:
+            bundles[system] = prepare_triangle_bundle(system, tables[count_key], tables[amount_key], sales)
+        except (ValueError, TypeError, OverflowError) as exc:
+            errors.append(f"Sheet「{selected[count_key].sheet_name}」/「{selected[amount_key].sheet_name}」: {exc}")
+    if errors:
+        raise ValueError("\n".join(errors))
+    actuals = {}
+    for (purpose, system, metric), table in tables.items():
+        if purpose == "验证数据":
+            actuals.setdefault(system, {})[metric] = table
+    return WorkbookImport(sales, bundles, mileage, actuals, issues)
 
 
 @dataclass
@@ -43,7 +252,7 @@ class TriangleBundle:
     """A fully validated, normalized claim triangle for one system.
 
     Attributes:
-        name: System name (or "单系统" for single-system mode).
+        name: Warranty system name.
         count: Incremental claim-count triangle, index=sale month, columns=MIS ages.
         amount: Incremental claim-amount triangle, same shape as ``count``.
         observed_mask: Boolean frame, True where the cell is historical/actual.

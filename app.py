@@ -20,7 +20,8 @@ for _font in ("Microsoft YaHei", "SimHei", "Noto Sans CJK SC", "Arial Unicode MS
 
 from src import claims_model, cost_model, data_io, excel_export, metrics, monte_carlo, weibull_model
 from src.pipeline import SystemResult, run_system_pipeline
-from src.utils import SALE_MONTH_COL, SALES_COL, SYSTEM_LIST, mis_col
+from src.import_ui import render_workbook_import, render_mileage_settings
+from src.utils import SALE_MONTH_COL, SALES_COL, mis_col
 
 st.set_page_config(page_title="AutoWarrantyCast - 车辆保修成本精算与预测系统", layout="wide")
 
@@ -100,23 +101,6 @@ if use_mileage_limit:
         "保修期里程限制（公里）", min_value=1000, value=100000, step=1000
     )
 
-st.sidebar.subheader("每月行驶里程")
-mileage_mode = st.sidebar.radio(
-    "里程输入方式", ["不提供（纯时间模型）", "固定值（公里/月）", "按销售批次上传"]
-)
-fixed_mileage = None
-mileage_upload_df = None
-if mileage_mode == "固定值（公里/月）":
-    fixed_mileage = st.sidebar.number_input("月均行驶里程", min_value=100, value=1500, step=100)
-elif mileage_mode == "按销售批次上传":
-    mileage_file = st.sidebar.file_uploader("上传月均行驶里程 CSV", type=["csv"], key="mileage_upload")
-    if mileage_file is not None:
-        try:
-            mileage_upload_df = data_io.load_mileage(mileage_file)
-            st.sidebar.success(f"已加载 {len(mileage_upload_df)} 个批次的里程数据")
-        except Exception as exc:  # noqa: BLE001 - surface parse errors to the user
-            st.sidebar.error(f"里程文件解析失败: {exc}")
-
 st.sidebar.subheader("小样本 / 冷启动优化设置")
 enable_few_shot = st.sidebar.checkbox(
     "启用小样本精度优化",
@@ -182,68 +166,9 @@ tab_import, tab_results, tab_download = st.tabs(["📥 数据导入区", "📊 �
 # Tab 1: data import
 # --------------------------------------------------------------------------
 with tab_import:
-    st.subheader("1. 月度销量导入")
-    sales_file = st.file_uploader("上传销量文件（CSV/Excel，列：销售月份、销量）", type=["csv", "xlsx", "xls"])
-    if sales_file is not None:
-        try:
-            st.session_state["sales_df"] = data_io.load_sales(sales_file)
-            st.success(f"成功加载 {len(st.session_state['sales_df'])} 个销售月份")
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"销量文件解析失败: {exc}")
-
-    if st.session_state["sales_df"] is not None:
-        st.dataframe(st.session_state["sales_df"], use_container_width=True, height=200)
-
-    st.divider()
-    st.subheader("2. 索赔数据导入")
-    import_mode = st.radio("导入模式", ["单系统导入", "多系统导入"], horizontal=True)
-
-    new_bundles: Dict[str, "data_io.TriangleBundle"] = {}
-    new_issues = {}
-
-    def _try_build_bundle(system_name: str, count_file, amount_file, sales_df) -> None:
-        try:
-            count_df = data_io.load_triangle_sheet(count_file)
-            amount_df = data_io.load_triangle_sheet(amount_file)
-            bundle = data_io.prepare_triangle_bundle(system_name, count_df, amount_df, sales_df)
-            new_bundles[system_name] = bundle
-            new_issues[system_name] = bundle.issues
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"[{system_name}] 三角形数据处理失败: {exc}")
-
+    render_workbook_import()
+    fixed_mileage, mileage_upload_df = render_mileage_settings()
     sales_df_current = st.session_state["sales_df"]
-
-    if import_mode == "单系统导入":
-        col1, col2 = st.columns(2)
-        with col1:
-            count_file = st.file_uploader("上传索赔台次（Excel）", type=["xlsx", "xls"], key="single_count")
-        with col2:
-            amount_file = st.file_uploader("上传索赔金额（Excel）", type=["xlsx", "xls"], key="single_amount")
-        if count_file is not None and amount_file is not None and sales_df_current is not None:
-            _try_build_bundle("单系统", count_file, amount_file, sales_df_current)
-        elif (count_file is not None or amount_file is not None) and sales_df_current is None:
-            st.warning("请先上传销量文件")
-    else:
-        if sales_df_current is None:
-            st.warning("请先上传销量文件，再导入各系统三角形数据")
-        for system in SYSTEM_LIST:
-            with st.expander(f"📁 {system}"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    cf = st.file_uploader(f"上传台次 - {system}", type=["xlsx", "xls"], key=f"count_{system}")
-                with c2:
-                    af = st.file_uploader(f"上传金额 - {system}", type=["xlsx", "xls"], key=f"amount_{system}")
-                if cf is not None and af is not None and sales_df_current is not None:
-                    _try_build_bundle(system, cf, af, sales_df_current)
-                    st.success(f"{system} 数据已导入")
-                    with st.container():
-                        preview_cols = [mis_col(a) for a in new_bundles[system].mis_ages[:8]]
-                        st.caption("原始三角形预览（增量口径，前 8 期）")
-                        st.dataframe(new_bundles[system].count[preview_cols].head(10), use_container_width=True)
-
-    if new_bundles:
-        st.session_state["bundles"] = new_bundles
-        st.session_state["import_issues"] = new_issues
 
     if st.session_state["bundles"]:
         st.divider()
@@ -490,42 +415,22 @@ with tab_results:
 
                     st.divider()
                     st.markdown("**验证数据（可选）**")
-                    with st.expander("上传真实未来数据以计算 MAE / MAPE"):
-                        vc1, vc2 = st.columns(2)
-                        with vc1:
-                            val_count_file = st.file_uploader(
-                                "上传实际索赔台次（Excel）", type=["xlsx", "xls"], key=f"val_count_{name}"
-                            )
-                        with vc2:
-                            val_amount_file = st.file_uploader(
-                                "上传实际索赔金额（Excel）", type=["xlsx", "xls"], key=f"val_amount_{name}"
-                            )
-                        if val_count_file is not None:
-                            try:
-                                actual_count = data_io.load_triangle_sheet(val_count_file)
-                                m = metrics.compute_validation_metrics(
-                                    result.count_filled, result.count_forecast_mask, actual_count
-                                )
-                                if m:
-                                    st.success(f"台次验证：MAE={m['MAE']:.2f}, MAPE={m['MAPE']:.2%}（{m['n_cells']} 个单元格）")
-                                else:
-                                    st.warning("未找到可比较的预测/实际数据重叠单元格")
-                            except Exception as exc:  # noqa: BLE001
-                                st.error(f"验证数据解析失败: {exc}")
-                        if val_amount_file is not None:
-                            try:
-                                actual_amount = data_io.load_triangle_sheet(val_amount_file)
-                                m = metrics.compute_validation_metrics(
-                                    result.amount_filled, result.amount_forecast_mask, actual_amount
-                                )
-                                if m:
-                                    st.success(f"金额验证：MAE={m['MAE']:.2f}, MAPE={m['MAPE']:.2%}（{m['n_cells']} 个单元格）")
-                                else:
-                                    st.warning("未找到可比较的预测/实际数据重叠单元格")
-                            except Exception as exc:  # noqa: BLE001
-                                st.error(f"验证数据解析失败: {exc}")
-                        if val_count_file is None and val_amount_file is None:
-                            st.info("无验证数据")
+                    with st.expander("工作簿实际数据验证（MAE / MAPE）"):
+                        imported = st.session_state["workbook_data"]
+                        actuals = imported.actuals.get(name, {})
+                        for label, predicted, forecast_mask in (
+                            ("台次", result.count_filled, result.count_forecast_mask),
+                            ("金额", result.amount_filled, result.amount_forecast_mask),
+                        ):
+                            if label not in actuals:
+                                continue
+                            m = metrics.compute_validation_metrics(predicted, forecast_mask, actuals[label])
+                            if m:
+                                st.success(f"{label}验证：MAE={m['MAE']:.2f}, MAPE={m['MAPE']:.2%}（{m['n_cells']} 个单元格）")
+                            else:
+                                st.warning(f"{label}：未找到可比较的预测/实际数据重叠单元格")
+                        if not actuals:
+                            st.info("工作簿未提供本系统的验证数据，可添加“系统名_验证台次 / 系统名_验证金额”Sheet 后重新导入。")
 
 
 # --------------------------------------------------------------------------
