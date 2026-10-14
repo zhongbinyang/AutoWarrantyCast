@@ -201,10 +201,11 @@ class WorkbookImportTests(unittest.TestCase):
             load(sheets)
 
     def test_existing_excel_reader_preserves_sheet(self):
-        path = ROOT / "sample_data" / "engine_claim_count.xlsx"
+        path = ROOT / "sample_data" / "保修预测导入示例.xlsx"
+        sheet_name = "发动机系统_台次"
         workbook = data_io.read_workbook(path.read_bytes())
-        normalized = data_io._normalize_triangle(next(iter(workbook.values())), "台次")
-        assert_frame_equal(normalized, data_io.load_triangle_sheet(path))
+        normalized = data_io._normalize_triangle(workbook[sheet_name], "台次")
+        assert_frame_equal(normalized, data_io.load_triangle_sheet(path, sheet_name=sheet_name))
         with self.assertRaises(Exception):
             data_io.read_workbook(b"not an xlsx")
 

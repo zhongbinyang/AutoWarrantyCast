@@ -27,7 +27,7 @@ AutoWarrantyCast/
 │   └── pipeline.py               # 端到端建模编排（无 Streamlit 依赖）
 ├── scripts/
 │   └── generate_sample_data.py   # 示例数据生成脚本
-├── sample_data/                  # 统一 Excel 示例及旧数据回归样本
+├── sample_data/                  # 统一 Excel 示例（仅保留一个工作簿）
 ├── launcher.py                   # 独立版打包启动入口（端口检测、自动开浏览器）
 ├── warranty_cost_system.spec     # PyInstaller 打包规格文件
 ├── build_exe.bat                 # 一键生成独立 exe 脚本
@@ -77,9 +77,9 @@ streamlit run app.py
 
 统一 Demo 的文件名为 `保修预测导入示例.xlsx`，页面从 `sample_data/` 提供下载。Demo 使用固定随机种子生成的模拟数据：30 个销售月份（2022-01 至 2024-06），发动机和底盘两个系统，历史数据截止 2024-07，另有 2024-08 至 2024-10 的实际模拟记录供验证。发动机包含里程驱动效应，底盘为纯时间驱动。
 
-运行 `python scripts/generate_sample_data.py` 可重新生成统一 Demo，包含使用说明及全部 10 个数据 Sheet。脚本使用项目已有的 openpyxl，不需要额外依赖；不会覆盖旧的回归样本。
+运行 `python scripts/generate_sample_data.py` 可重新生成统一 Demo，包含使用说明及全部 10 个数据 Sheet。脚本使用项目已有的 openpyxl，不需要额外依赖。
 
-目录中的旧分文件样本仅保留用于回归测试，不是当前应用的上传格式。
+`sample_data/` 仅保留这个统一工作簿，示例导入和回归测试均使用它。
 
 ## 数据格式规范
 

@@ -2,7 +2,7 @@
 
 Produces ``sample_data/保修预测导入示例.xlsx`` with instructions, monthly
 sales, mileage, two systems' historical triangles and held-out actuals.
-Older separate sample files are retained as regression fixtures.
+The same workbook is used by the application and regression tests.
 
 Each system uses a distinct true Weibull hazard so the two triangles look
 meaningfully different, with Poisson claim-count noise and lognormal cost
